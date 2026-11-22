@@ -1,0 +1,432 @@
+// AppCloner — macOS App 分身工具（微信 / QQ / 企业微信 / 任意 App）
+// 原理：复制原版 App → 修改 Bundle ID → ad-hoc 重新签名
+// 系统把分身当成另一个独立 App，可同时运行，数据互相隔离。
+// 支持 Apple Silicon（M1/M2/M3/M4…）与 Intel，macOS 13+
+
+import SwiftUI
+import AppKit
+import UniformTypeIdentifiers
+
+// MARK: - 常量
+
+let kSourcePath = "AppClonerSourcePath"
+let kSourceVersion = "AppClonerSourceVersion"
+let kIndex = "AppClonerIndex"
+let cloneDir = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent("Applications/AppClones", isDirectory: true)
+let lsregister = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+
+// MARK: - 模型
+
+struct CloneInfo: Identifiable {
+    let url: URL
+    var id: String { url.path }
+    let name: String
+    let bundleID: String
+    let index: Int
+    let sourceURL: URL
+    let clonedVersion: String
+
+    var sourceMissing: Bool { !FileManager.default.fileExists(atPath: sourceURL.path) }
+    var needsRebuild: Bool {
+        guard let v = Cloner.version(of: sourceURL) else { return false }
+        return v != clonedVersion
+    }
+    var isRunning: Bool { !NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty }
+}
+
+enum ClonerError: LocalizedError {
+    case message(String)
+    var errorDescription: String? {
+        switch self { case .message(let m): return m }
+    }
+}
+
+// MARK: - 核心逻辑
+
+enum Cloner {
+    static func run(_ tool: String, _ args: [String]) throws {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: tool)
+        p.arguments = args
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        try p.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        guard p.terminationStatus == 0 else {
+            let out = String(decoding: data, as: UTF8.self)
+            let name = (tool as NSString).lastPathComponent
+            throw ClonerError.message("\(name) 执行失败（code \(p.terminationStatus)）：\n\(out)")
+        }
+    }
+
+    static func infoPlistURL(_ app: URL) -> URL { app.appendingPathComponent("Contents/Info.plist") }
+
+    static func readInfo(_ app: URL) -> [String: Any]? {
+        guard let data = try? Data(contentsOf: infoPlistURL(app)) else { return nil }
+        return (try? PropertyListSerialization.propertyList(from: data, format: nil)) as? [String: Any]
+    }
+
+    static func writeInfo(_ info: [String: Any], to app: URL) throws {
+        let data = try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
+        try data.write(to: infoPlistURL(app), options: .atomic)
+    }
+
+    static func version(of app: URL) -> String? {
+        guard let i = readInfo(app) else { return nil }
+        let short = i["CFBundleShortVersionString"] as? String ?? "?"
+        let build = i["CFBundleVersion"] as? String ?? "?"
+        return "\(short) (\(build))"
+    }
+
+    static func displayName(of app: URL) -> String {
+        let n = FileManager.default.displayName(atPath: app.path)
+        return n.hasSuffix(".app") ? String(n.dropLast(4)) : n
+    }
+
+    static func listClones() -> [CloneInfo] {
+        guard let items = try? FileManager.default.contentsOfDirectory(
+            at: cloneDir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else { return [] }
+        return items.filter { $0.pathExtension == "app" }.compactMap { url -> CloneInfo? in
+            guard let i = readInfo(url),
+                  let src = i[kSourcePath] as? String,
+                  let bid = i["CFBundleIdentifier"] as? String else { return nil }
+            return CloneInfo(url: url,
+                             name: url.deletingPathExtension().lastPathComponent,
+                             bundleID: bid,
+                             index: i[kIndex] as? Int ?? 0,
+                             sourceURL: URL(fileURLWithPath: src),
+                             clonedVersion: i[kSourceVersion] as? String ?? "")
+        }.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+
+    /// 同一个原版 App 的下一个可用编号（从 2 开始）
+    static func nextIndex(for sourceID: String, existing: [CloneInfo]) -> Int {
+        let used = Set(existing.filter { $0.bundleID.hasPrefix(sourceID + ".clone") }.map(\.index))
+        var n = 2
+        while used.contains(n) { n += 1 }
+        return n
+    }
+
+    static func makeClone(source: URL, name: String, index: Int, keepEntitlements: Bool,
+                          log: @escaping (String) -> Void) throws {
+        guard let srcInfo = readInfo(source), let srcID = srcInfo["CFBundleIdentifier"] as? String else {
+            throw ClonerError.message("这不是有效的 App：读取不到 Info.plist / Bundle ID")
+        }
+        if srcInfo[kSourcePath] != nil {
+            throw ClonerError.message("不能给分身再做分身，请选择原版 App")
+        }
+        let safeName = name.replacingOccurrences(of: "/", with: "-").trimmingCharacters(in: .whitespaces)
+        guard !safeName.isEmpty else { throw ClonerError.message("分身名称不能为空") }
+
+        let fm = FileManager.default
+        try fm.createDirectory(at: cloneDir, withIntermediateDirectories: true)
+        let dest = cloneDir.appendingPathComponent(safeName + ".app")
+        let tmp = cloneDir.appendingPathComponent(".\(UUID().uuidString).app")
+        let newID = "\(srcID).clone\(index)"
+
+        log("① 复制 \(source.lastPathComponent) …")
+        try run("/usr/bin/ditto", [source.path, tmp.path])
+        do {
+            log("② 修改 Bundle ID：\(srcID) → \(newID)")
+            var info = readInfo(tmp) ?? srcInfo
+            info["CFBundleIdentifier"] = newID
+            info["CFBundleName"] = safeName
+            info["CFBundleDisplayName"] = safeName
+            info[kSourcePath] = source.path
+            info[kSourceVersion] = version(of: source) ?? ""
+            info[kIndex] = index
+            info["SUEnableAutomaticChecks"] = false // 分身不自己更新，原版更新后点「重建」
+            try writeInfo(info, to: tmp)
+
+            log("③ 移除隔离属性 …")
+            _ = try? run("/usr/bin/xattr", ["-cr", tmp.path])
+
+            // Apple Silicon 上所有 arm64 代码必须有签名，改了 Info.plist 后原签名失效，
+            // 所以这里用 ad-hoc 签名（"-"）重新签整个 bundle，Intel 同样适用。
+            log("④ 重新签名（ad-hoc）…")
+            var args = ["--force", "--deep", "--sign", "-"]
+            if keepEntitlements { args.append("--preserve-metadata=entitlements") }
+            args.append(tmp.path)
+            try run("/usr/bin/codesign", args)
+
+            if fm.fileExists(atPath: dest.path) { try fm.removeItem(at: dest) }
+            try fm.moveItem(at: tmp, to: dest)
+        } catch {
+            try? fm.removeItem(at: tmp)
+            throw error
+        }
+
+        log("⑤ 注册到系统 …")
+        _ = try? run(lsregister, ["-f", dest.path])
+        log("✅ 完成：\(dest.path)")
+    }
+}
+
+// MARK: - ViewModel
+
+@MainActor
+final class AppModel: ObservableObject {
+    @Published var source: URL?
+    @Published var cloneName = ""
+    @Published var keepEntitlements = false
+    @Published var clones: [CloneInfo] = []
+    @Published var log: [String] = []
+    @Published var errorText: String?
+    @Published var busy = false
+
+    init() { refresh() }
+
+    func refresh() { clones = Cloner.listClones() }
+
+    func choose(_ url: URL) {
+        guard url.pathExtension == "app" else { errorText = "请选择 .app 应用"; return }
+        errorText = nil
+        source = url
+        let base = Cloner.displayName(of: url)
+        if let id = Cloner.readInfo(url)?["CFBundleIdentifier"] as? String {
+            cloneName = "\(base) \(Cloner.nextIndex(for: id, existing: clones))"
+        } else {
+            cloneName = "\(base) 2"
+        }
+    }
+
+    func pickWithPanel() {
+        let panel = NSOpenPanel()
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        panel.allowedContentTypes = [.application]
+        panel.allowsMultipleSelection = false
+        panel.prompt = "选择"
+        if panel.runModal() == .OK, let url = panel.url { choose(url) }
+    }
+
+    func createClone() {
+        guard let src = source,
+              let id = Cloner.readInfo(src)?["CFBundleIdentifier"] as? String else { return }
+        let name = cloneName.trimmingCharacters(in: .whitespaces)
+        if clones.contains(where: { $0.name == name }) {
+            errorText = "已存在同名分身「\(name)」，换个名字，或在下方列表里点「重建」"
+            return
+        }
+        perform(source: src, name: name, index: Cloner.nextIndex(for: id, existing: clones))
+    }
+
+    func rebuild(_ c: CloneInfo) {
+        if c.isRunning { errorText = "请先退出「\(c.name)」再重建"; return }
+        perform(source: c.sourceURL, name: c.name, index: c.index)
+    }
+
+    func launch(_ c: CloneInfo) {
+        NSWorkspace.shared.openApplication(at: c.url, configuration: NSWorkspace.OpenConfiguration()) { _, err in
+            if let err {
+                let msg = "启动失败：\(err.localizedDescription)\n可尝试切换「保留权限声明」选项后重建。"
+                Task { @MainActor in self.errorText = msg }
+            }
+        }
+    }
+
+    func reveal(_ url: URL) { NSWorkspace.shared.activateFileViewerSelecting([url]) }
+
+    func openCloneFolder() {
+        try? FileManager.default.createDirectory(at: cloneDir, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(cloneDir)
+    }
+
+    func delete(_ c: CloneInfo) {
+        if c.isRunning { errorText = "请先退出「\(c.name)」再删除"; return }
+        let alert = NSAlert()
+        alert.messageText = "删除分身「\(c.name)」？"
+        alert.informativeText = "App 会被移到废纸篓。该分身的聊天记录等数据保留在 ~/Library 中，不会被删除。"
+        alert.addButton(withTitle: "删除")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        NSWorkspace.shared.recycle([c.url]) { _, _ in
+            Task { @MainActor in self.refresh() }
+        }
+    }
+
+    private func perform(source: URL, name: String, index: Int) {
+        busy = true
+        log = []
+        errorText = nil
+        let keep = keepEntitlements
+        Task.detached {
+            do {
+                try Cloner.makeClone(source: source, name: name, index: index, keepEntitlements: keep) { line in
+                    Task { @MainActor in self.log.append(line) }
+                }
+            } catch {
+                var msg = error.localizedDescription
+                if msg.contains("Operation not permitted") || msg.contains("Permission denied") {
+                    msg += "\n\n提示：打开「系统设置 → 隐私与安全性 → App 管理」，允许 AppCloner 后重试。"
+                }
+                let finalMsg = msg
+                await MainActor.run { self.errorText = finalMsg }
+            }
+            await MainActor.run {
+                self.busy = false
+                self.refresh()
+            }
+        }
+    }
+}
+
+// MARK: - 界面
+
+@main
+struct AppClonerApp: App {
+    @StateObject private var model = AppModel()
+    var body: some Scene {
+        WindowGroup("App 分身") {
+            ContentView()
+                .environmentObject(model)
+                .frame(minWidth: 640, minHeight: 560)
+        }
+        .windowResizability(.contentMinSize)
+    }
+}
+
+struct AppIcon: View {
+    let url: URL?
+    let size: CGFloat
+    var body: some View {
+        Group {
+            if let url {
+                Image(nsImage: NSWorkspace.shared.icon(forFile: url.path)).resizable()
+            } else {
+                Image(systemName: "square.dashed").resizable().foregroundStyle(.secondary)
+            }
+        }
+        .frame(width: size, height: size)
+    }
+}
+
+struct ContentView: View {
+    @EnvironmentObject var model: AppModel
+    @State private var dropTargeted = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            GroupBox("新建分身") {
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack(spacing: 12) {
+                        AppIcon(url: model.source, size: 48)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(model.source.map { Cloner.displayName(of: $0) } ?? "把 App 拖到这里，或点「选择 App…」")
+                                .font(.headline)
+                            if let s = model.source {
+                                Text(s.path).font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                        Spacer()
+                        Button("选择 App…") { model.pickWithPanel() }
+                    }
+                    .padding(10)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8)
+                            .strokeBorder(dropTargeted ? Color.accentColor : Color.secondary.opacity(0.35),
+                                          style: StrokeStyle(lineWidth: 1.5, dash: [5]))
+                    )
+                    .onDrop(of: [.fileURL], isTargeted: $dropTargeted) { providers in
+                        guard let p = providers.first else { return false }
+                        _ = p.loadObject(ofClass: URL.self) { url, _ in
+                            if let url { Task { @MainActor in model.choose(url) } }
+                        }
+                        return true
+                    }
+
+                    HStack {
+                        Text("分身名称")
+                        TextField("例如：微信 2", text: $model.cloneName)
+                            .textFieldStyle(.roundedBorder)
+                        Button("生成分身") { model.createClone() }
+                            .keyboardShortcut(.defaultAction)
+                            .disabled(model.source == nil || model.busy
+                                      || model.cloneName.trimmingCharacters(in: .whitespaces).isEmpty)
+                    }
+
+                    Toggle("保留原 App 的权限声明（entitlements）—— 分身打不开时可切换此项后重建",
+                           isOn: $model.keepEntitlements)
+                        .font(.caption)
+                }
+                .padding(4)
+            }
+
+            GroupBox {
+                if model.clones.isEmpty {
+                    Text("还没有分身").foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, minHeight: 100)
+                } else {
+                    List(model.clones) { c in CloneRow(clone: c) }
+                        .listStyle(.inset)
+                        .frame(minHeight: 180)
+                }
+            } label: {
+                HStack {
+                    Text("已有分身（\(model.clones.count)）")
+                    Spacer()
+                    Button("刷新") { model.refresh() }.buttonStyle(.link)
+                    Button("打开分身文件夹") { model.openCloneFolder() }.buttonStyle(.link)
+                }
+            }
+
+            if model.busy || !model.log.isEmpty || model.errorText != nil {
+                GroupBox(model.busy ? "处理中…" : "日志") {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 3) {
+                            ForEach(Array(model.log.enumerated()), id: \.offset) { item in
+                                Text(item.element)
+                            }
+                            if let e = model.errorText {
+                                Text(e).foregroundStyle(.red)
+                            }
+                        }
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(height: 110)
+                }
+            }
+        }
+        .padding(20)
+    }
+}
+
+struct CloneRow: View {
+    @EnvironmentObject var model: AppModel
+    let clone: CloneInfo
+
+    var body: some View {
+        HStack(spacing: 10) {
+            AppIcon(url: clone.url, size: 32)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(clone.name).font(.body.weight(.medium))
+                Text(clone.bundleID).font(.caption).foregroundStyle(.secondary)
+                if clone.sourceMissing {
+                    Label("原版 App 已不存在", systemImage: "exclamationmark.triangle")
+                        .font(.caption).foregroundStyle(.red)
+                } else if clone.needsRebuild {
+                    Label("原版已更新，建议点「重建」", systemImage: "arrow.triangle.2.circlepath")
+                        .font(.caption).foregroundStyle(.orange)
+                }
+            }
+            Spacer()
+            Button("启动") { model.launch(clone) }
+            Button("重建") { model.rebuild(clone) }
+                .disabled(model.busy || clone.sourceMissing)
+            Menu {
+                Button("在 Finder 中显示") { model.reveal(clone.url) }
+                Divider()
+                Button("删除…", role: .destructive) { model.delete(clone) }
+            } label: {
+                Image(systemName: "ellipsis.circle")
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+        }
+        .padding(.vertical, 4)
+    }
+}
